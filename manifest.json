@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "FedEx Shipment Quick-Fill",
+  "version": "0.1.5",
+  "description": "Quickly populate selected FedEx Shipping Plus shipment fields.",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.fedex.com/shippingplus/*"
+      ],
+      "js": [
+        "core/dom.js",
+        "core/presets.js",
+        "modules/fedex-shipment.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "permissions": [
+    "clipboardRead"
+  ]
+}
