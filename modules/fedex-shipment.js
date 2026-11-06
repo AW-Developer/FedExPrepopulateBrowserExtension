@@ -125,6 +125,34 @@
     hint.textContent = "Drag this panel by its title. Copy recipient details first, then choose a package preset.";
     panel.append(heading, hint);
 
+    // Address Only reads the clipboard and fills recipient/address fields;
+    // it deliberately leaves package, return-label, and shipment options alone.
+    async function runAddressOnly(button) {
+      button.disabled = true;
+      status.textContent = "Reading clipboard and filling address fields…";
+      try {
+        const addressFields = await API.readClipboardAddress();
+        const results = API.fillFields(addressFields);
+        const hasAddress = addressFields.some(field =>
+          /^address line [123]$/i.test(field.label || "") && String(field.value ?? "").trim()
+        );
+        const nextField = hasAddress ? "Shipment Reference" : "Contact name";
+        if (!API.focusField(nextField)) {
+          console.warn(`FedEx Quick-Fill: Could not focus the "${nextField}" field.`);
+        }
+        const filled = results.filter(result => result.status === "filled").length;
+        const skipped = results.length - filled;
+        console.info(`FedEx Quick-Fill: Address Only filled ${filled} field(s); ${skipped} field(s) need attention.`, results);
+        status.textContent = `Address: filled ${filled}; ${skipped} need attention.`;
+      } catch (error) {
+        console.error("FedEx Quick-Fill address-only error:", error);
+        status.textContent = "Could not fill address. See browser console.";
+      } finally {
+        button.disabled = false;
+        dismiss();
+      }
+    }
+
     async function runPreset(preset, button) {
       button.disabled = true;
       status.textContent = "Reading clipboard and filling fields…";
@@ -142,15 +170,67 @@
           } else {
             const sameReady = await API.waitForFields(["Is the same as the outbound shipment"], 30_000);
             if (sameReady) {
-              const returnResults = API.fillFields([
-                { label: "Is the same as the outbound shipment", value: preset.returnDetails.sameAsOutbound === true },
-                ...preset.returnDetails.fields
+              // Unchecking this option makes FedEx create the independent
+              // return-package controls asynchronously. Do not try to fill
+              // them in the same tick as the checkbox change: at that point
+              // the old outbound controls may still be the only controls in
+              // the DOM. Wait until the return Weight and all three dimension
+              // inputs are actually rendered and visible before filling.
+              const sameResult = API.fillFields([
+                { label: "Is the same as the outbound shipment", value: preset.returnDetails.sameAsOutbound === true }
               ]);
-              results = results.concat(returnResults);
+              results = results.concat(sameResult);
+
+              const returnPackageReady = await API.waitForFields([
+                "Weight 1",
+                "Dimensions Length",
+                "Dimensions Width",
+                "Dimensions Height"
+              ], 30_000);
+
+              if (returnPackageReady) {
+                // Configure the independent return package before setting the
+                // return-instruction options below.
+                const returnResults = API.fillFields(preset.returnDetails.fields);
+                results = results.concat(returnResults);
+              } else {
+                console.warn("FedEx Quick-Fill: Independent return weight/dimension controls did not appear after unchecking the same-as-outbound option.");
+                status.textContent = "Return package fields did not finish loading; enter return weight and dimensions manually.";
+              }
             } else {
               console.warn('FedEx Quick-Fill: Return details controls did not appear.');
               status.textContent = "Return details did not finish loading; check them manually.";
             }
+
+            // Return-label preferences: include the instruction sheet, use
+            // English, add the shipment reference, and personalize the note.
+            // Enable the instruction option first: FedEx may render the
+            // language and personalized-message controls only after it is checked.
+            const includeReady = await API.waitForFields(["Include return instructions"], 20_000);
+            if (includeReady) {
+              results = results.concat(API.fillFields([
+                { label: "Include return instructions", value: true }
+              ]));
+              const instructionFields = [
+                { label: "Language for return instructions", value: "English" },
+                { label: "Personalized message on return instructions", value: "Please put Dongle and cables that are in the box with the return label affixed on it back into box and send back to \"Medical Positioning, Inc\" once stirrups are installed." },
+                { label: "Add shipment references", value: true }
+              ];
+              const detailsReady = await API.waitForFields(instructionFields.map(field => field.label), 20_000);
+              if (detailsReady) results = results.concat(API.fillFields(instructionFields));
+              else {
+                console.warn("FedEx Quick-Fill: Return instruction language/message/reference controls did not appear.");
+                status.textContent = "Return instructions not fully available; check the return tab.";
+              }
+            } else {
+              console.warn("FedEx Quick-Fill: Include return instructions control was not found.");
+              status.textContent = "Return instruction option not found; check the return tab.";
+            }
+
+            // Finish on Outbound Details so the user can continue the shipment.
+            const outboundReady = await API.waitForTextControl("Outbound Details", 15_000);
+            if (outboundReady) API.clickTextControl("Outbound Details");
+            else console.warn('FedEx Quick-Fill: Could not return to the "Outbound Details" tab.');
           }
         }
 
@@ -178,6 +258,12 @@
       }
     }
 
+    const addressOnlyButton = document.createElement("button");
+    addressOnlyButton.type = "button";
+    addressOnlyButton.textContent = "Address Only";
+    addressOnlyButton.addEventListener("click", () => runAddressOnly(addressOnlyButton));
+    panel.append(addressOnlyButton);
+
     for (const preset of API.presets) {
       const button = document.createElement("button");
       button.type = "button";
@@ -199,8 +285,52 @@
     }
   }
 
+  // The print/confirmation screen can expose several ancillary documents.
+  // This button downloads eligible document links while deliberately skipping
+  // the shipping label, which FedEx prints automatically.
+  function mountPrintDownloads() {
+    if (document.getElementById("fedex-quick-fill-downloads")) return;
+    const host = document.createElement("div");
+    host.id = "fedex-quick-fill-downloads";
+    host.style.cssText = "position:fixed;right:16px;top:16px;z-index:2147483647;";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = "Download other shipment documents";
+    button.style.cssText = "padding:10px 14px;background:#4b1f6f;color:#fff;border:0;border-radius:7px;font:600 13px Arial;cursor:pointer;box-shadow:0 3px 12px #0003;";
+    button.addEventListener("click", () => {
+      // Prefer actual document/download links. Label links are excluded by
+      // their visible text, accessible name, URL, and download filename.
+      const links = [...document.querySelectorAll('a[href]')].filter(link => {
+        const text = `${link.textContent || ""} ${link.getAttribute("aria-label") || ""} ${link.href} ${link.getAttribute("download") || ""}`.toLowerCase();
+        const looksLikeDocument = link.hasAttribute("download") || /document|commercial invoice|customs|receipt|return instructions|packing slip|pro forma|certificate/.test(text);
+        const isLabel = /shipping label|outbound label|return label|label\.pdf|label\/download/.test(text);
+        return looksLikeDocument && !isLabel && link.href && !link.href.startsWith("javascript:");
+      });
+      const unique = [...new Map(links.map(link => [link.href, link])).values()];
+      if (!unique.length) {
+        button.textContent = "No other document links found";
+        return;
+      }
+      unique.forEach((link, index) => window.setTimeout(() => link.click(), index * 350));
+      button.textContent = `Requested ${unique.length} document download(s)`;
+    });
+    host.append(button);
+    document.documentElement.append(host);
+  }
+
+  function checkPrintRoute() {
+    // FedEx print/confirmation route names vary by workflow; only add the
+    // helper when the page visibly contains a print/document heading or links.
+    const pathLooksLikePrint = /print|document|confirmation/i.test(location.pathname);
+    const pageText = (document.body?.innerText || "").slice(0, 12000).toLowerCase();
+    const hasPrintContent = /print shipment|shipment documents|print documents|download documents/.test(pageText);
+    if (pathLooksLikePrint && hasPrintContent) mountPrintDownloads();
+    else document.getElementById("fedex-quick-fill-downloads")?.remove();
+  }
+
   function checkRoute() {
     const href = location.href;
+    checkPrintRoute();
     const currentTarget = isShipmentCreatePage();
     if (href === lastHref && currentTarget === activeRoute) return;
     lastHref = href;
