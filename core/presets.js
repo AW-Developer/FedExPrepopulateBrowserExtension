@@ -17,7 +17,7 @@
     { label: "Small Pkg (8x8)", fields: packageFields(2, 8, 8, 8), returnLabel: false },
     {
       label: "Sturup-kit",
-      fields: packageFields(20, 15, 12, 12),
+      fields: packageFields(22, 24, 6, 8),
       returnLabel: true,
       returnDetails: {
         sameAsOutbound: false,

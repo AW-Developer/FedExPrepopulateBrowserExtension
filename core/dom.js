@@ -218,62 +218,78 @@
     return result;
   }
 
-  // Clipboard format:
-  // First nonblank line is either "Attn: Person" or the company name.
-  // The final nonblank line is always "City ST ZIP". Lines between them
-  // are Address lines 1-3. Blank lines are ignored so omitted address lines
-  // never cause the city/state/ZIP line to shift position.
+  // Clipboard parsing supports two common layouts:
+  //   Attn: Person / Company / optional department / numbered street / City ST ZIP
+  //   Contact / Company / numbered street / optional street lines / City ST ZIP
+  // The first numbered line is always Address line 1. Extra lines between the
+  // company header and that numbered line are treated as additional address
+  // lines (for example, a building or pavilion name).
   function parseClipboardAddress(text) {
-    const lines = String(text ?? "")
-      .replace(/\r/g, "")
-      .split("\n")
-      .map(line => line.trim())
-      .filter(Boolean);
-
+    const lines = String(text ?? "").replace(/\r/g, "").split("\n").map(line => line.trim()).filter(Boolean);
     if (!lines.length) return [];
 
-    const firstLine = lines[0];
-    const attnMatch = firstLine.match(/^attn\s*:\s*(.*)$/i);
-    let contactName;
-    let company;
-    let addressStart;
-
-    if (attnMatch) {
-      contactName = attnMatch[1].trim();
-      company = lines[1] || "";
-      addressStart = 2;
-    } else {
-      company = firstLine;
-      contactName = firstLine;
-      addressStart = 1;
+    // The final line must be a city, two-letter state, and ZIP/ZIP+4.
+    const localityIndex = lines.length - 1;
+    const localityMatch = lines[localityIndex].match(/^(.*?)\s*,?\s+([A-Za-z]{2})\s+(\d{5}(?:-\d{4})?)$/);
+    if (!localityMatch || !localityMatch[1].trim()) {
+      console.warn("FedEx Quick-Fill: Final clipboard line is not City ST ZIP:", lines[localityIndex]);
+      return [];
     }
+
+    // Find the first line beginning with a number; this is the primary street line.
+    const addressStart = lines.findIndex((line, index) => index < localityIndex && /^\d/.test(line));
+    if (addressStart < 0) return [];
+
+    const header = lines.slice(0, addressStart);
+    const numberedAddressLines = lines.slice(addressStart, localityIndex);
+    let contactName = "";
+    let company = "";
+    let extraAddressLines = [];
+
+    // An Attn header explicitly identifies the contact. The next line is the
+    // company; any remaining pre-street line(s) are building/address details.
+    const hasAttn = /^attn\s*:/i.test(header[0] || "");
+    if (hasAttn) {
+      contactName = header[0].replace(/^attn\s*:\s*/i, "").trim();
+      company = header[1] || "";
+      extraAddressLines = header.slice(2);
+    } else if (header.length === 1) {
+      contactName = company = header[0];
+    } else if (header.length === 2) {
+      contactName = header[0];
+      company = header[1];
+    } else if (header.length > 2) {
+      // For an unmarked multi-line header, keep the first two name lines and
+      // interpret the rest as building/address lines rather than losing them.
+      contactName = header[0];
+      company = header[1];
+      extraAddressLines = header.slice(2);
+    }
+
+    // Preserve the requested three-line minimum for ordinary address blocks.
+    // An Attn/contact + company + building-name + numbered-street pattern is
+    // the useful exception: the building name becomes Address line 2, as in
+    // "Medical Pavilion" above "1111 Example Avenue".
+    const addressLineCount = numberedAddressLines.length + extraAddressLines.length;
+    const attnBuildingException = hasAttn && extraAddressLines.length > 0 && numberedAddressLines.length >= 1;
+    if (addressLineCount < 3 && !attnBuildingException) {
+      console.info("FedEx Quick-Fill: Fewer than three address lines found; treating clipboard address as blank.");
+      return [];
+    }
+
+    const addressLines = numberedAddressLines.slice();
+    // The numbered street is line 1; pre-street building names follow it.
+    addressLines.splice(1, 0, ...extraAddressLines);
 
     const values = [];
     if (contactName) values.push({ label: "Contact name", value: fitRecipientName(contactName) });
     if (company) values.push({ label: "Company", value: fitRecipientName(company) });
-
-    // The last nonblank line is reserved for City, State, ZIP.
-    const locality = lines.length > addressStart ? lines[lines.length - 1] : "";
-    const addressLines = lines.slice(addressStart, Math.max(addressStart, lines.length - 1));
-    const addressLabels = ["Address line 1", "Address line 2", "Address line 3"];
-
-    addressLines.slice(0, 3).forEach((value, index) => {
-      values.push({ label: addressLabels[index], value });
+    ["Address line 1", "Address line 2", "Address line 3"].forEach((label, index) => {
+      if (addressLines[index]) values.push({ label, value: addressLines[index] });
     });
-
-    if (locality) {
-      // Accept "Kansas City MO 64108" and "Kansas City, MO 64108".
-      // ZIP+4 is supported; city names may contain multiple words.
-      const match = locality.match(/^(.*?)\s*,?\s+([A-Za-z]{2})\s+(\d{5}(?:-\d{4})?)$/);
-      if (match && match[1].trim()) {
-        values.push({ label: "City", value: match[1].trim().replace(/,\s*$/, "") });
-        values.push({ label: "State or province", value: match[2].toUpperCase() });
-        values.push({ label: "Postal code", value: match[3] });
-      } else {
-        console.warn("FedEx Quick-Fill: Could not parse the final nonblank clipboard line as 'City ST ZIP':", locality);
-      }
-    }
-
+    values.push({ label: "City", value: localityMatch[1].trim().replace(/,\s*$/, "") });
+    values.push({ label: "State or province", value: localityMatch[2].toUpperCase() });
+    values.push({ label: "Postal code", value: localityMatch[3] });
     return values;
   }
 
